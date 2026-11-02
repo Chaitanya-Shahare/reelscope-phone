@@ -1,0 +1,30 @@
+# reelscope tick (published with the phone page by src/phone.ts; source: reelscope/cloud/tick-workflow.yml).
+# GitHub runs scheduled workflows "best effort": the data repo's hourly sync fired only every 3 to 5 hours (Nov 1).
+# This public repo's minutes are free, so it checks six times an hour, and when nothing has reached the private data
+# repo for 50 minutes (the Mac is off) it pushes one tiny commit to .tick/ there. A push starts the data repo's sync
+# reliably. The log prints only "fresh" or "ticked".
+name: tick
+on:
+  schedule: [{ cron: '4,14,24,34,44,54 * * * *' }]
+  workflow_dispatch:
+    inputs:
+      force: { description: 'Tick even if something synced recently (test)', type: boolean, default: false }
+permissions: {}
+concurrency: { group: tick, cancel-in-progress: false }
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - env: { TICK_KEY: '${{ secrets.TICK_KEY }}' }
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/k" && printf '%s\n' "$TICK_KEY" > "$RUNNER_TEMP/k"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q --depth 40 --filter=blob:none --no-checkout git@github.com:Chaitanya-Shahare/reelscope-data.git d
+          cd d
+          last=$(git log -1 --format=%ct -- . ':!.tick')
+          if [ $(( $(date +%s) - ${last:-0} )) -lt 3000 ] && [ "${{ inputs.force }}" != "true" ]; then echo fresh; exit 0; fi
+          git sparse-checkout set --no-cone /.tick/ && git checkout -q
+          mkdir -p .tick && date -u +%FT%TZ > .tick/at
+          git add .tick && git -c user.name='reelscope tick' -c user.email=reelscope@users.noreply.github.com commit -qm tick
+          git push -q && echo ticked || echo "push raced a laptop push; nothing to do"
