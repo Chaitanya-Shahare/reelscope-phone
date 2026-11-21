@@ -1,0 +1,61 @@
+# reelscope tick (published with the phone page by src/phone.ts; source: reelscope/cloud/tick-workflow.yml).
+# Two jobs, both on this public repo's free minutes, every 5 minutes:
+# 1. Posting: reads due.txt in the private outbox repo and, about 4 minutes before a queued slot that nobody has
+#    fired yet (the Mac fires it when awake), pushes the slot to .tick/fired there. That push starts the publish run,
+#    so the private repo spends minutes only on runs that post (Nov 7: idle scheduled runs used ~5,000 a month).
+# 2. Data sync, below.
+# GitHub runs scheduled workflows "best effort": the data repo's hourly sync fired only every 3 to 5 hours (Nov 1).
+# This public repo's minutes are free, so it checks six times an hour, and when nothing has reached the private data
+# repo for 50 minutes (the Mac is off) it pushes one tiny commit to .tick/ there. A push starts the data repo's sync
+# reliably. The log prints only "fresh" or "ticked".
+name: tick
+on:
+  schedule: [{ cron: '*/5 * * * *' }]
+  workflow_dispatch:
+    inputs:
+      force: { description: 'Tick even if something synced recently (test)', type: boolean, default: false }
+permissions: {}
+concurrency: { group: tick, cancel-in-progress: false }
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: fire due posting slots
+        continue-on-error: true
+        env: { OUTBOX_KEY: '${{ secrets.OUTBOX_KEY }}' }
+        run: |
+          [ -n "$OUTBOX_KEY" ] || { echo "no OUTBOX_KEY"; exit 0; }
+          install -m 600 /dev/null "$RUNNER_TEMP/o" && printf '%s\n' "$OUTBOX_KEY" > "$RUNNER_TEMP/o"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/o -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          for try in 1 2 3; do
+            rm -rf "$RUNNER_TEMP/ob"
+            git clone -q --depth 1 --filter=blob:none --no-checkout git@github.com:Chaitanya-Shahare/reelscope-outbox.git "$RUNNER_TEMP/ob"
+            cd "$RUNNER_TEMP/ob" && git sparse-checkout set --no-cone /due.txt /.tick/ && git checkout -q
+            now=$(date +%s); fire=""
+            for at in $(cat due.txt 2>/dev/null); do
+              d=$((at - now))
+              # 4 minutes ahead; up to 20 minutes late when scheduled ticks were dropped
+              if [ "$d" -le 240 ] && [ "$d" -gt -1200 ] && ! grep -q "^$at " .tick/fired 2>/dev/null; then fire="$fire $at"; fi
+            done
+            [ -n "$fire" ] || { echo idle; exit 0; }
+            mkdir -p .tick
+            for at in $fire; do echo "$at tick $(date -u +%FT%TZ)" >> .tick/fired; done
+            tail -n 300 .tick/fired > .tick/f && mv .tick/f .tick/fired
+            git add .tick && git -c user.name='reelscope tick' -c user.email=reelscope@users.noreply.github.com commit -qm "fire$fire (tick)"
+            git push -q && { echo "fired$fire"; exit 0; }
+            cd "$RUNNER_TEMP"   # the Mac pushed first: look again
+          done
+      - name: data sync
+        env: { TICK_KEY: '${{ secrets.TICK_KEY }}' }
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/k" && printf '%s\n' "$TICK_KEY" > "$RUNNER_TEMP/k"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q --depth 40 --filter=blob:none --no-checkout git@github.com:Chaitanya-Shahare/reelscope-data.git d
+          cd d
+          last=$(git log -1 --format=%ct -- . ':!.tick')
+          if [ $(( $(date +%s) - ${last:-0} )) -lt 3000 ] && [ "${{ inputs.force }}" != "true" ]; then echo fresh; exit 0; fi
+          git sparse-checkout set --no-cone /.tick/ && git checkout -q
+          mkdir -p .tick && date -u +%FT%TZ > .tick/at
+          git add .tick && git -c user.name='reelscope tick' -c user.email=reelscope@users.noreply.github.com commit -qm tick
+          git push -q && echo ticked || echo "push raced a laptop push; nothing to do"
